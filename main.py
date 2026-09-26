@@ -166,7 +166,18 @@ class ContinuousMessagePlugin(Star):
             )
             return ""
 
-    async def _finalize_merged(self, event: AstrMessageEvent, buffer: list, images: list):
+    @staticmethod
+    def _collect_reply_comps(event: AstrMessageEvent) -> list:
+        """收集事件中的引用(Reply)组件，供事件重构后回挂，保证 LLM 能看到引用内容。"""
+        try:
+            return [
+                c for c in getattr(event.message_obj, "message", []) or []
+                if c.__class__.__name__ == 'Reply'
+            ]
+        except Exception:
+            return []
+
+    async def _finalize_merged(self, event: AstrMessageEvent, buffer: list, images: list, reply_comps: list | None = None):
         """对最终消息执行链接解析、图片本地化与事件重构。"""
         original_image_count = len(images)
         merged_text = self.merge_separator.join(buffer).strip()
@@ -216,6 +227,17 @@ class ContinuousMessagePlugin(Star):
             all_images,
             prefer_filesystem_images=self.image_localizer.enabled,
         )
+
+        # 回挂引用组件：reconstruct_event 只保留文本+图片，会把 Reply 丢弃，
+        # 导致 qq_official 等非 aiocqhttp 平台 LLM 收不到引用消息。
+        # 这里把防抖窗口内收集到的原始 Reply 重新加回消息链，
+        # 由 AstrBot 核心的引用解析（<Quoted Message>）原生处理。
+        if reply_comps:
+            try:
+                event.message_obj.message = list(event.message_obj.message) + list(reply_comps)
+                logger.info(f"[消息防抖动] 已回挂 {len(reply_comps)} 个引用(Reply)组件")
+            except Exception as exc:
+                logger.error(f"[消息防抖动] 回挂引用组件失败: {exc}")
 
     async def _timer_coroutine(self, uid: str, duration: float):
         """
@@ -500,6 +522,7 @@ class ContinuousMessagePlugin(Star):
                 event,
                 [raw_text] if raw_text else [],
                 list(current_urls),
+                reply_comps=self._collect_reply_comps(event),
             )
             return
 
@@ -520,6 +543,9 @@ class ContinuousMessagePlugin(Star):
                 session['buffer'].append(raw_text)
             if current_urls:
                 session['images'].extend(current_urls)
+            reply_comps = self._collect_reply_comps(event)
+            if reply_comps:
+                session.setdefault('reply_comps', []).extend(reply_comps)
 
             # 重置计时器：自适应防抖会根据新增消息形态决定下一轮等待时长。
             if session.get('timer_task'):
@@ -570,6 +596,7 @@ class ContinuousMessagePlugin(Star):
         }
 
         self.sessions[uid] = {
+            'reply_comps': self._collect_reply_comps(event),
             'buffer': [raw_text] if raw_text else [],
             'images': list(current_urls),
             'items': [first_item],
@@ -598,5 +625,5 @@ class ContinuousMessagePlugin(Star):
         if uid not in self.sessions:
             return
         session_data = self.sessions.pop(uid)
-        await self._finalize_merged(event, session_data['buffer'], session_data['images'])
+        await self._finalize_merged(event, session_data['buffer'], session_data['images'], session_data.get('reply_comps'))
         return
